@@ -745,7 +745,7 @@ lvgl:
     # Now Playing Screen
     # ################################################
     - id: page_player
-      bg_color: 0x464B55
+      bg_color: 0x0C191E
       widgets:
         # Volume arc (outer ring, 135°–45° sweep)
         - arc:
@@ -768,116 +768,91 @@ lvgl:
               arc_opa: 100%
             knob:
               bg_opa: 0%
-        # Outer decorative ring
+        # Cover art
+        - image:
+            id: player_cover
+            align: TOP_MID
+            y: 18
+            width: 100
+            height: 100
+            src: cover_art
+            bg_color: 0x0C191E
+        # Play/pause icon over cover
         - obj:
-            align: CENTER
-            width: 200
-            height: 200
-            radius: 100
-            bg_color: 0x646464
-            border_color: 0x2D323C
-            border_width: 2
-            shadow_color: 0x050A0F
-            shadow_width: 40
-            shadow_ofs_y: 15
+            align: TOP_MID
+            y: 43
+            width: 50
+            height: 50
+            radius: 25
+            bg_color: 0x000000
+            bg_opa: 50%
+            border_width: 0
             scrollbar_mode: "OFF"
             widgets:
-              # Inner content circle
-              - obj:
+              - label:
+                  id: play_icon
                   align: CENTER
-                  width: 180
-                  height: 180
-                  radius: 90
-                  bg_color: 0x0C191E
-                  border_color: 0x5A646E
-                  border_width: 1
-                  scrollbar_mode: "OFF"
-                  widgets:
-                    # Cover art
-                    - image:
-                        id: player_cover
-                        align: TOP_MID
-                        y: 10
-                        width: 70
-                        height: 70
-                        src: cover_art
-                        bg_color: 0x0C191E
-                    # Play/pause icon over cover
-                    - obj:
-                        align: TOP_MID
-                        y: 25
-                        width: 40
-                        height: 40
-                        radius: 20
-                        bg_color: 0x000000
-                        bg_opa: 50%
-                        border_width: 0
-                        scrollbar_mode: "OFF"
-                        widgets:
-                          - label:
-                              id: play_icon
-                              align: CENTER
-                              text: ">"
-                              text_font: nanopod_font_24
-                              text_color: 0xFFFFFF
-                    # Track title (scrolls if long)
-                    - label:
-                        id: track_title
-                        align: CENTER
-                        y: 28
-                        width: 160
-                        height: 30
-                        text: ""
-                        text_font: nanopod_font_16
-                        text_color: 0xFFFFFF
-                        long_mode: DOT
-                        text_align: CENTER
-                    # Artist name
-                    - label:
-                        id: track_artist
-                        align: CENTER
-                        y: 60
-                        width: 160
-                        height: 24
-                        text: ""
-                        text_font: nanopod_font_14
-                        text_color: 0x808080
-                        long_mode: DOT
-                        text_align: CENTER
-                    # Volume overlay (hidden, shown briefly on volume change)
-                    - obj:
-                        id: volume_container
-                        align: CENTER
-                        y: 80
-                        width: 130
-                        height: 24
-                        bg_color: 0x0C191E
-                        bg_opa: 90%
-                        radius: 12
-                        border_width: 0
-                        scrollbar_mode: "OFF"
-                        hidden: true
-                        widgets:
-                          - label:
-                              align: LEFT_MID
-                              x: 8
-                              text: "Vol"
-                              text_font: nanopod_font_14
-                              text_color: 0x808080
-                          - bar:
-                              id: volume_bar
-                              align: RIGHT_MID
-                              x: -8
-                              width: 80
-                              height: 8
-                              value: 50
-                              min_value: 0
-                              max_value: 100
-                              radius: 4
-                              bg_color: 0x1E232D
-                              indicator:
-                                bg_color: 0x36B9F6
-                                radius: 4
+                  text: ">"
+                  text_font: nanopod_font_24
+                  text_color: 0xFFFFFF
+        # Track title
+        - label:
+            id: track_title
+            align: CENTER
+            y: 15
+            width: 200
+            height: 34
+            text: ""
+            text_font: nanopod_font_18
+            text_color: 0xFFFFFF
+            long_mode: DOT
+            text_align: CENTER
+        # Artist name
+        - label:
+            id: track_artist
+            align: CENTER
+            y: 50
+            width: 200
+            height: 28
+            text: ""
+            text_font: nanopod_font_16
+            text_color: 0x808080
+            long_mode: DOT
+            text_align: CENTER
+        # Volume overlay (hidden, shown briefly on volume change)
+        - obj:
+            id: volume_container
+            align: CENTER
+            y: 78
+            width: 150
+            height: 26
+            bg_color: 0x1A2530
+            bg_opa: 95%
+            radius: 13
+            border_width: 0
+            scrollbar_mode: "OFF"
+            hidden: true
+            widgets:
+              - label:
+                  align: LEFT_MID
+                  x: 10
+                  text: "Vol"
+                  text_font: nanopod_font_14
+                  text_color: 0x808080
+              - bar:
+                  id: volume_bar
+                  align: RIGHT_MID
+                  x: -10
+                  width: 90
+                  height: 8
+                  value: 50
+                  min_value: 0
+                  max_value: 100
+                  radius: 4
+                  bg_color: 0x1E2D3A
+                  indicator:
+                    bg_color: 0x36B9F6
+                    radius: 4
 
 font:
   - file: "gfonts://Montserrat"
@@ -890,6 +865,13 @@ font:
   - file: "gfonts://Montserrat"
     id: nanopod_font_16
     size: 16
+    bpp: 4
+    glyphsets:
+      - GF_Latin_Kernel
+      - GF_Latin_Core
+  - file: "gfonts://Montserrat"
+    id: nanopod_font_18
+    size: 18
     bpp: 4
     glyphsets:
       - GF_Latin_Kernel
