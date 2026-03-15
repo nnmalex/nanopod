@@ -153,6 +153,13 @@ sensor:
             if (!std::isnan(x)) {
               id(current_volume) = (int)(x * 100.0f);
             }
+        - if:
+            condition:
+              lambda: 'return id(current_screen) == 1;'
+            then:
+              - lvgl.arc.update:
+                  id: volume_arc
+                  value: !lambda 'return id(current_volume);'
 
   # Rotary encoder - always controls volume
   - platform: rotary_encoder
@@ -441,6 +448,9 @@ script:
           id: play_icon
           text: !lambda |-
             return std::string(id(is_playing) ? "| |" : ">");
+      - lvgl.arc.update:
+          id: volume_arc
+          value: !lambda 'return id(current_volume);'
       - lvgl.bar.update:
           id: volume_bar
           value: !lambda 'return id(current_volume);'
@@ -636,6 +646,9 @@ script:
           condition:
             lambda: 'return id(current_screen) == 1;'
           then:
+            - lvgl.arc.update:
+                id: volume_arc
+                value: !lambda 'return id(current_volume);'
             - lvgl.bar.update:
                 id: volume_bar
                 value: !lambda 'return id(current_volume);'
@@ -734,6 +747,27 @@ lvgl:
     - id: page_player
       bg_color: 0x464B55
       widgets:
+        # Volume arc (outer ring, 135°–45° sweep)
+        - arc:
+            id: volume_arc
+            align: CENTER
+            width: 240
+            height: 240
+            arc_width: 15
+            start_angle: 135
+            end_angle: 45
+            value: 50
+            min_value: 0
+            max_value: 100
+            adjustable: false
+            bg_opa: 0%
+            arc_opa: 0%
+            indicator:
+              arc_color: 0x36B9F6
+              arc_width: 15
+              arc_opa: 100%
+            knob:
+              bg_opa: 0%
         # Outer decorative ring
         - obj:
             align: CENTER
