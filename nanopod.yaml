@@ -1,8 +1,9 @@
 substitutions:
-  ma_host: "192.168.0.157"
-  ma_port: "8095"
-  ma_token: "z4lw6YU4SocmbYnwcRBm5XTRzbBvT7BrvkZauBeC7ApGCrG0Y_aGzYYMtsr23fmY"
-  ma_player: "ma_room_kinderzimmer_linda"
+  # HA media_player entity ID (without the "media_player." prefix)
+  ma_player: "office_assistant"
+  # HA base URL and long-lived access token (add ha_token to secrets.yaml)
+  ha_url: "http://homeassistant.local:8123"
+  ha_token: !secret ha_token
 
 esphome:
   name: nanopod
@@ -20,16 +21,12 @@ esphome:
           id: backlight
           brightness: 100%
       - logger.log: "Display power enabled"
-      # Initialize activity timer
-      - lambda: 'id(last_activity_ms) = millis();'
       - delay: 500ms
       - script.execute: led_idle
-      - script.execute: update_home_display
-      - wait_until:
-          wifi.connected:
-      - logger.log: "WiFi connected, fetching artists..."
-      - delay: 2000ms
-      - script.execute: fetch_artists
+      - script.execute: update_display
+      - logger.log:
+          format: "Watching HA entity: media_player.%s"
+          args: ['"${ma_player}"']
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -37,6 +34,9 @@ esp32:
   framework:
     type: esp-idf
     version: recommended
+    sdkconfig_options:
+      CONFIG_HTTPD_MAX_REQ_HDR_LEN: "1024"
+      CONFIG_ESP_HTTP_CLIENT_BUF_SIZE: "1024"
   flash_size: 16MB
 
 psram:
@@ -66,75 +66,152 @@ logger:
   level: DEBUG
 
 # ============================================
-# Music Assistant Configuration
+# Time (from Home Assistant)
 # ============================================
+time:
+  - platform: homeassistant
+    id: ha_time
 
-# Configurable player ID (editable from Home Assistant)
-text:
-  - platform: template
-    id: ma_player_id
-    name: "Media Player ID"
-    optimistic: true
-    min_length: 1
-    max_length: 64
-    mode: text
-    restore_value: false
-    initial_value: "${ma_player}"
-    icon: "mdi:speaker"
+# ============================================
+# Home Assistant State Sensors
+# ============================================
+text_sensor:
+  # Media player state ("playing", "paused", "idle", "off", etc.)
+  - platform: homeassistant
+    id: ha_player_state
+    entity_id: "media_player.${ma_player}"
     on_value:
       then:
-        - logger.log:
-            format: "Media player changed to: %s"
-            args: ['x.c_str()']
+        - lambda: |-
+            bool playing = (x == "playing");
+            id(is_playing) = playing;
+            id(current_screen) = playing ? 1 : 0;
+            ESP_LOGI("ha", "Player state: %s -> screen=%d", x.c_str(), id(current_screen));
+        # Wake display if playback starts while sleeping
+        - script.execute: update_display
+        - if:
+            condition:
+              lambda: 'return id(is_playing);'
+            then:
+              - script.execute: led_playing
+            else:
+              - script.execute: led_idle
 
+  # Track title
+  - platform: homeassistant
+    id: ha_media_title
+    entity_id: "media_player.${ma_player}"
+    attribute: media_title
+    on_value:
+      then:
+        - lambda: 'id(media_title) = x;'
+        - if:
+            condition:
+              lambda: 'return id(current_screen) == 1;'
+            then:
+              - script.execute: update_player_display
+
+  # Artist name
+  - platform: homeassistant
+    id: ha_media_artist
+    entity_id: "media_player.${ma_player}"
+    attribute: media_artist
+    on_value:
+      then:
+        - lambda: 'id(media_artist) = x;'
+        - if:
+            condition:
+              lambda: 'return id(current_screen) == 1;'
+            then:
+              - script.execute: update_player_display
+
+  # Cover art URL (entity_picture may be a relative HA path)
+  - platform: homeassistant
+    id: ha_entity_picture
+    entity_id: "media_player.${ma_player}"
+    attribute: entity_picture
+    on_value:
+      then:
+        - lambda: |-
+            if (x.empty() || x == "unavailable") return;
+            if (x[0] == '/') {
+              id(current_cover_url) = "${ha_url}" + x;
+            } else {
+              id(current_cover_url) = x;
+            }
+            ESP_LOGI("ha", "Cover URL: %s", id(current_cover_url).c_str());
+        - script.execute: update_cover_art
+
+sensor:
+  # Volume level from HA (0.0–1.0)
+  - platform: homeassistant
+    id: ha_volume
+    entity_id: "media_player.${ma_player}"
+    attribute: volume_level
+    on_value:
+      then:
+        - lambda: |-
+            if (!std::isnan(x)) {
+              id(current_volume) = (int)(x * 100.0f);
+            }
+
+  # Rotary encoder - always controls volume
+  - platform: rotary_encoder
+    id: dial
+    name: "Dial Position"
+    pin_a: GPIO45
+    pin_b: GPIO42
+    resolution: 1
+    on_clockwise:
+      - lambda: 'id(current_volume) = std::min(id(current_volume) + 5, 100);'
+      - script.execute: ma_set_volume
+      - script.execute: led_show_volume
+    on_anticlockwise:
+      - lambda: 'id(current_volume) = std::max(id(current_volume) - 5, 0);'
+      - script.execute: ma_set_volume
+      - script.execute: led_show_volume
+
+# ============================================
+# HTTP for Music Assistant API
+# ============================================
 http_request:
   useragent: esphome/nanopod
   timeout: 10s
   verify_ssl: false
 
-# Online image for cover art
+# Cover art image
 online_image:
   - id: cover_art
-    url: "https://via.placeholder.com/120.jpg"  # Placeholder, updated dynamically
+    url: "https://via.placeholder.com/100.jpg"
     format: JPEG
     resize: 100x100
     type: RGB565
     on_download_finished:
       then:
-        - logger.log: "Cover art downloaded, updating widgets..."
-        - lvgl.image.update:
-            id: home_cover
-            src: cover_art
-        - lvgl.image.update:
-            id: album_cover
-            src: cover_art
+        - logger.log: "Cover art downloaded"
         - lvgl.image.update:
             id: player_cover
             src: cover_art
-        - logger.log: "Widgets updated"
     on_error:
       then:
         - logger.log:
             format: "Cover art download failed"
-            level: ERROR
+            level: WARN
 
 # ============================================
 # Hardware Configuration
 # ============================================
 
-# SPI Bus for Display
 spi:
   clk_pin: GPIO10
   mosi_pin: GPIO11
 
-# I2C Bus for Touch
 i2c:
   - id: bus_touch
     sda: GPIO6
     scl: GPIO7
     scan: false
 
-# CST816S Touchscreen
 touchscreen:
   - platform: cst816
     id: touch
@@ -152,7 +229,6 @@ touchscreen:
           ESP_LOGD("touch", "Touch start: %d, %d", touch.x, touch.y);
     on_update:
       - lambda: |-
-          // Update end position as finger moves
           for (auto &tp : touches) {
             id(touch_end_x) = tp.x;
             id(touch_end_y) = tp.y;
@@ -161,7 +237,7 @@ touchscreen:
       - script.execute: handle_touch_gesture
       - lambda: |-
           id(touch_active) = false;
-          id(last_nav_ms) = millis();  // Block button presses after touch
+          id(last_nav_ms) = millis();
 
 # Power rails - CRITICAL for CrowPanel!
 output:
@@ -173,7 +249,6 @@ output:
     id: backlight_power
     pin: GPIO2
 
-  # PWM backlight for fade effects
   - platform: ledc
     id: backlight_pwm
     pin: GPIO46
@@ -194,10 +269,7 @@ switch:
     restore_mode: ALWAYS_ON
     internal: true
 
-
-# RGB LEDs
 light:
-  # Backlight with PWM for fade effects
   - platform: monochromatic
     id: backlight
     name: "Display Backlight"
@@ -213,115 +285,32 @@ light:
     num_leds: 5
     name: "Status LEDs"
     effects:
-      - addressable_rainbow:
-          name: "Rainbow"
-          speed: 10
       - pulse:
           name: "Playing Pulse"
           transition_length: 1s
           update_interval: 1s
           min_brightness: 30%
           max_brightness: 100%
-      - strobe:
-          name: "Error"
-          colors:
-            - state: true
-              brightness: 100%
-              red: 100%
-              green: 0%
-              blue: 0%
-              duration: 500ms
-            - state: false
-              duration: 500ms
 
 # ============================================
-# Global State and Data Storage
+# Global State
 # ============================================
 globals:
   - id: current_screen
     type: int
-    initial_value: "0"  # 0=HOME, 1=ALBUMS, 2=PLAYING
-  - id: selected_artist
-    type: int
-    initial_value: "0"
-  - id: selected_album
-    type: int
-    initial_value: "0"
-  - id: current_volume
-    type: int
-    initial_value: "50"
+    initial_value: "0"  # 0=CLOCK, 1=PLAYING
   - id: is_playing
     type: bool
     initial_value: "false"
-  # Sleep mode tracking
-  - id: last_activity_ms
-    type: uint32_t
-    initial_value: "0"
-  - id: display_sleeping
-    type: bool
-    initial_value: "false"
-  - id: artist_count
+  - id: current_volume
     type: int
-    initial_value: "0"
-  - id: album_count
-    type: int
-    initial_value: "0"
-  # Navigation debounce to prevent double-tap issues
+    initial_value: "50"
   - id: last_nav_ms
     type: uint32_t
     initial_value: "0"
-  # Track when touch is active to ignore spurious button presses
   - id: touch_active
     type: bool
     initial_value: "false"
-  # Pagination state for lazy loading
-  - id: total_album_count
-    type: int
-    initial_value: "0"
-  - id: loaded_album_count
-    type: int
-    initial_value: "0"
-  - id: loading_in_progress
-    type: bool
-    initial_value: "false"
-  - id: initial_load_complete
-    type: bool
-    initial_value: "false"
-  # Artist data (max 10 artists)
-  - id: artist_names
-    type: std::vector<std::string>
-  - id: artist_ids
-    type: std::vector<std::string>
-  # Album data for current artist (max 20 albums)
-  - id: album_names
-    type: std::vector<std::string>
-  - id: album_ids
-    type: std::vector<std::string>
-  - id: album_uris
-    type: std::vector<std::string>
-  - id: album_artist_ids
-    type: std::vector<std::string>
-  - id: album_images
-    type: std::vector<std::string>
-  # One cover image per artist (first album found)
-  - id: artist_images
-    type: std::vector<std::string>
-  # Current cover art URL for display
-  - id: current_cover_url
-    type: std::string
-  # Filtered albums for current artist
-  - id: filtered_album_names
-    type: std::vector<std::string>
-  - id: filtered_album_ids
-    type: std::vector<std::string>
-  - id: filtered_album_uris
-    type: std::vector<std::string>
-  - id: filtered_album_images
-    type: std::vector<std::string>
-  # HTTP request body storage
-  - id: request_body
-    type: std::string
-  # Touch gesture tracking
   - id: touch_start_x
     type: int
     initial_value: "0"
@@ -337,162 +326,29 @@ globals:
   - id: touch_start_ms
     type: uint32_t
     initial_value: "0"
-  # Gesture result: 0=none, 1=select, 2=next, 3=prev, 4=back, 5=volume_change
-  - id: gesture_type
-    type: int
-    initial_value: "0"
-  - id: screen_before_gesture
-    type: int
-    initial_value: "0"
+  - id: current_cover_url
+    type: std::string
+  - id: media_title
+    type: std::string
+  - id: media_artist
+    type: std::string
 
-# Sleep mode check interval
+# ============================================
+# Intervals
+# ============================================
 interval:
-  - interval: 10s
+  # Clock update every second
+  - interval: 1s
     then:
       - if:
           condition:
-            lambda: |-
-              return !id(display_sleeping) &&
-                     !id(is_playing) &&
-                     (millis() - id(last_activity_ms) > 60000);
+            lambda: 'return id(current_screen) == 0;'
           then:
-            - logger.log: "Idle timeout - entering sleep mode"
-            - script.execute: enter_sleep_mode
+            - script.execute: update_clock_display
 
-  # Background album loading - fetch next page every 2 seconds when idle
-  - interval: 2s
-    then:
-      - if:
-          condition:
-            lambda: |-
-              // Only load if:
-              // 1. Initial load complete
-              // 2. Not currently loading
-              // 3. More albums to load
-              // 4. Not sleeping
-              // 5. On home screen only (don't load while browsing albums/playing)
-              // 6. User idle for 1s
-              return id(initial_load_complete) &&
-                     !id(loading_in_progress) &&
-                     id(loaded_album_count) < id(total_album_count) &&
-                     !id(display_sleeping) &&
-                     id(current_screen) == 0 &&
-                     (millis() - id(last_activity_ms) > 1000);
-          then:
-            - script.execute: fetch_album_page
-
-# Rotary Encoder
-sensor:
-  - platform: rotary_encoder
-    id: dial
-    name: "Dial Position"
-    pin_a: GPIO45
-    pin_b: GPIO42
-    resolution: 1
-    on_clockwise:
-      # Reset activity timer
-      - lambda: 'id(last_activity_ms) = millis();'
-      # Wake from sleep if sleeping
-      - if:
-          condition:
-            lambda: 'return id(display_sleeping);'
-          then:
-            - script.execute: wake_from_sleep
-          else:
-            - lambda: |-
-                int screen = id(current_screen);
-                if (screen == 0) {
-                  // HOME: next artist
-                  if (id(artist_count) > 0) {
-                    id(selected_artist) = (id(selected_artist) + 1) % id(artist_count);
-                    // Update cover for this artist
-                    if (id(selected_artist) < id(artist_images).size() && !id(artist_images)[id(selected_artist)].empty()) {
-                      id(current_cover_url) = id(artist_images)[id(selected_artist)];
-                    }
-                  }
-                  ESP_LOGI("nav", "Artist: %d", id(selected_artist));
-                } else if (screen == 1) {
-                  // ALBUMS: next album
-                  if (id(album_count) > 0) {
-                    id(selected_album) = (id(selected_album) + 1) % id(album_count);
-                    // Update cover for this album
-                    if (id(selected_album) < id(filtered_album_images).size() && !id(filtered_album_images)[id(selected_album)].empty()) {
-                      id(current_cover_url) = id(filtered_album_images)[id(selected_album)];
-                    }
-                  }
-                  ESP_LOGI("nav", "Album: %d", id(selected_album));
-                } else if (screen == 2) {
-                  // PLAYING: volume up
-                  id(current_volume) = std::min(id(current_volume) + 5, 100);
-                  ESP_LOGI("nav", "Volume: %d", id(current_volume));
-                }
-            - script.execute: update_display
-            - if:
-                condition:
-                  lambda: 'return id(current_screen) == 0 || id(current_screen) == 1;'
-                then:
-                  - script.execute: update_cover_art
-            - if:
-                condition:
-                  lambda: 'return id(current_screen) == 2;'
-                then:
-                  - script.execute: ma_set_volume
-                  - script.execute: led_show_volume
-                else:
-                  - script.execute: led_show_position
-    on_anticlockwise:
-      # Reset activity timer
-      - lambda: 'id(last_activity_ms) = millis();'
-      # Wake from sleep if sleeping
-      - if:
-          condition:
-            lambda: 'return id(display_sleeping);'
-          then:
-            - script.execute: wake_from_sleep
-          else:
-            - lambda: |-
-                int screen = id(current_screen);
-                if (screen == 0) {
-                  // HOME: previous artist
-                  if (id(artist_count) > 0) {
-                    id(selected_artist) = (id(selected_artist) + id(artist_count) - 1) % id(artist_count);
-                    // Update cover for this artist
-                    if (id(selected_artist) < id(artist_images).size() && !id(artist_images)[id(selected_artist)].empty()) {
-                      id(current_cover_url) = id(artist_images)[id(selected_artist)];
-                    }
-                  }
-                  ESP_LOGI("nav", "Artist: %d", id(selected_artist));
-                } else if (screen == 1) {
-                  // ALBUMS: previous album
-                  if (id(album_count) > 0) {
-                    id(selected_album) = (id(selected_album) + id(album_count) - 1) % id(album_count);
-                    // Update cover for this album
-                    if (id(selected_album) < id(filtered_album_images).size() && !id(filtered_album_images)[id(selected_album)].empty()) {
-                      id(current_cover_url) = id(filtered_album_images)[id(selected_album)];
-                    }
-                  }
-                  ESP_LOGI("nav", "Album: %d", id(selected_album));
-                } else if (screen == 2) {
-                  // PLAYING: volume down
-                  id(current_volume) = std::max(id(current_volume) - 5, 0);
-                  ESP_LOGI("nav", "Volume: %d", id(current_volume));
-                }
-            - script.execute: update_display
-            - if:
-                condition:
-                  lambda: 'return id(current_screen) == 0 || id(current_screen) == 1;'
-                then:
-                  - script.execute: update_cover_art
-            - if:
-                condition:
-                  lambda: 'return id(current_screen) == 2;'
-                then:
-                  - script.execute: ma_set_volume
-                  - script.execute: led_show_volume
-                else:
-                  - script.execute: led_show_position
-
-# Encoder Button
+# ============================================
+# Button (encoder push)
+# ============================================
 binary_sensor:
   - platform: gpio
     id: dial_button
@@ -504,692 +360,103 @@ binary_sensor:
     filters:
       - delayed_on: 20ms
       - delayed_off: 20ms
-    on_press:
-      # Reset activity timer on any press
-      - lambda: 'id(last_activity_ms) = millis();'
-      # Wake from sleep if sleeping
-      - if:
-          condition:
-            lambda: 'return id(display_sleeping);'
-          then:
-            - script.execute: wake_from_sleep
     on_multi_click:
-      # Short click (under 500ms): Navigate forward or toggle
+      # Short click: play/pause toggle
       - timing:
           - ON for at most 500ms
           - OFF for at least 50ms
         then:
-          # Skip if we just woke from sleep
           - if:
               condition:
-                lambda: 'return !id(display_sleeping);'
+                lambda: 'return !id(touch_active) && (millis() - id(last_nav_ms) >= 500);'
               then:
-                - lambda: |-
-                    // Ignore button if touch is active or just ended (touch triggers button!)
-                    if (id(touch_active) || (millis() - id(last_nav_ms) < 500)) {
-                      ESP_LOGD("nav", "Ignoring click - touch active or recent");
-                      return;
-                    }
-                    int screen = id(current_screen);
-                    // Track previous screen for transition detection
-                    id(screen_before_gesture) = screen;
-                    if (screen == 0) {
-                      // HOME: Click opens albums for artist
-                      id(current_screen) = 1;
-                      id(selected_album) = 0;
-                      id(last_nav_ms) = millis();
-                      ESP_LOGI("nav", "HOME -> ALBUMS");
-                    } else if (screen == 1) {
-                      // ALBUMS: Click plays album
-                      id(current_screen) = 2;
-                      id(is_playing) = true;
-                      id(last_nav_ms) = millis();
-                      ESP_LOGI("nav", "ALBUMS -> PLAYING");
-                    } else if (screen == 2) {
-                      // PLAYING: Click toggles play/pause
-                      id(is_playing) = !id(is_playing);
-                      ESP_LOGI("nav", "Play/Pause: %s", id(is_playing) ? "playing" : "paused");
-                    }
                 - if:
                     condition:
-                      lambda: 'return id(current_screen) == 1;'
-                    then:
-                      - script.execute: fetch_albums
-                - script.execute: update_display
-                - if:
-                    condition:
-                      # Entering player from albums - start new playback
-                      lambda: 'return id(current_screen) == 2 && id(screen_before_gesture) == 1;'
-                    then:
-                      - script.execute: ma_play_album
-                      - script.execute: led_playing
-                - if:
-                    condition:
-                      # Toggling play on player screen
-                      lambda: 'return id(current_screen) == 2 && id(screen_before_gesture) == 2 && id(is_playing);'
-                    then:
-                      - script.execute: ma_resume
-                      - script.execute: led_playing
-                - if:
-                    condition:
-                      # Toggling pause on player screen
-                      lambda: 'return id(current_screen) == 2 && id(screen_before_gesture) == 2 && !id(is_playing);'
+                      lambda: 'return id(is_playing);'
                     then:
                       - script.execute: ma_pause
                       - script.execute: led_paused
-      # Long press (1s+): Go back one screen
+                    else:
+                      - script.execute: ma_resume
+                      - script.execute: led_playing
+      # Long press: stop
       - timing:
           - ON for at least 800ms
         then:
-          - if:
-              condition:
-                lambda: 'return !id(display_sleeping);'
-              then:
-                - lambda: |-
-                    int screen = id(current_screen);
-                    if (screen == 1) {
-                      // ALBUMS: Long press goes back to HOME
-                      id(current_screen) = 0;
-                      ESP_LOGI("nav", "ALBUMS -> HOME (long press)");
-                    } else if (screen == 2) {
-                      // PLAYING: Long press stops and goes back to ALBUMS
-                      id(is_playing) = false;
-                      id(current_screen) = 1;
-                      ESP_LOGI("nav", "PLAYING -> ALBUMS (long press)");
-                    }
-                - script.execute: ma_stop
-          - script.execute: update_display
+          - script.execute: ma_stop
           - script.execute: led_idle
 
 # ============================================
 # Scripts
 # ============================================
 script:
-  # Enter sleep mode - fade out display and power down
-  - id: enter_sleep_mode
-    then:
-      - logger.log: "Entering sleep mode..."
-      - lambda: 'id(display_sleeping) = true;'
-      # Fade out backlight over 2 seconds
-      - light.turn_off:
-          id: backlight
-          transition_length: 2s
-      - delay: 2.5s
-      # Turn off display power to save energy
-      - switch.turn_off: lcd_power_switch
-      # Enable WiFi modem sleep for power savings
-      - lambda: |-
-          wifi::global_wifi_component->set_power_save_mode(wifi::WIFI_POWER_SAVE_HIGH);
-          ESP_LOGI("sleep", "WiFi modem sleep enabled");
-      - logger.log: "Display sleeping, WiFi in power save"
-
-  # Wake from sleep - restore display and reload catalog
-  - id: wake_from_sleep
-    then:
-      - logger.log: "Waking from sleep..."
-      # Disable WiFi power save for full performance
-      - lambda: |-
-          wifi::global_wifi_component->set_power_save_mode(wifi::WIFI_POWER_SAVE_NONE);
-          ESP_LOGI("sleep", "WiFi power save disabled");
-      # Turn on display power
-      - switch.turn_on: lcd_power_switch
-      - delay: 100ms
-      # Fade in backlight over 1 second
-      - light.turn_on:
-          id: backlight
-          brightness: 100%
-          transition_length: 1s
-      - lambda: |-
-          id(display_sleeping) = false;
-          id(last_activity_ms) = millis();
-      - delay: 500ms
-      # Reload catalog
-      - script.execute: fetch_artists
-      - script.execute: update_display
-      - logger.log: "Wake complete"
-
-  # Handle touch gesture - detect swipe direction and execute action
-  - id: handle_touch_gesture
-    then:
-      - lambda: 'id(last_activity_ms) = millis();'
-      - if:
-          condition:
-            lambda: 'return id(display_sleeping);'
-          then:
-            - script.execute: wake_from_sleep
-          else:
-            - lambda: |-
-                // Use stored end position from on_update
-                int end_x = id(touch_end_x);
-                int end_y = id(touch_end_y);
-
-                int dx = end_x - id(touch_start_x);
-                int dy = end_y - id(touch_start_y);
-                uint32_t duration = millis() - id(touch_start_ms);
-
-                // Thresholds
-                const int SWIPE_THRESHOLD = 30;  // pixels minimum for swipe
-                const int TAP_MAX_MOVE = 20;     // max movement for tap
-                const uint32_t TAP_MAX_TIME = 300; // max ms for tap
-
-                bool is_tap = (abs(dx) < TAP_MAX_MOVE && abs(dy) < TAP_MAX_MOVE && duration < TAP_MAX_TIME);
-                bool is_horizontal = abs(dx) > abs(dy);
-                bool is_swipe = (is_horizontal ? abs(dx) : abs(dy)) > SWIPE_THRESHOLD;
-
-                int screen = id(current_screen);
-                id(screen_before_gesture) = screen;
-                id(gesture_type) = 0;  // Reset
-
-                ESP_LOGI("touch", "Gesture: dx=%d dy=%d dur=%dms tap=%d swipe=%d", dx, dy, duration, is_tap, is_swipe);
-
-                if (is_tap) {
-                  // Tap = forward action (select / play-pause)
-                  ESP_LOGI("touch", "TAP detected");
-                  // Debounce: ignore if navigated recently (prevents double-tap skipping screens)
-                  if (millis() - id(last_nav_ms) < 400) {
-                    ESP_LOGD("touch", "Ignoring tap - debounce");
-                  } else {
-                    id(gesture_type) = 1;  // SELECT
-                    if (screen == 0) {
-                      id(current_screen) = 1;
-                      id(selected_album) = 0;
-                      id(last_nav_ms) = millis();
-                    } else if (screen == 1) {
-                      id(current_screen) = 2;
-                      id(is_playing) = true;
-                      id(last_nav_ms) = millis();
-                    } else if (screen == 2) {
-                      id(is_playing) = !id(is_playing);
-                    }
-                  }
-                } else if (is_swipe) {
-                  if (is_horizontal) {
-                    if (dx > 0) {
-                      // SWIPE RIGHT = next
-                      ESP_LOGI("touch", "SWIPE RIGHT");
-                      id(gesture_type) = 2;  // NEXT
-                      if (screen == 0 && id(artist_count) > 0) {
-                        id(selected_artist) = (id(selected_artist) + 1) % id(artist_count);
-                        if (id(selected_artist) < id(artist_images).size() && !id(artist_images)[id(selected_artist)].empty()) {
-                          id(current_cover_url) = id(artist_images)[id(selected_artist)];
-                        }
-                      } else if (screen == 1 && id(album_count) > 0) {
-                        id(selected_album) = (id(selected_album) + 1) % id(album_count);
-                        if (id(selected_album) < id(filtered_album_images).size() && !id(filtered_album_images)[id(selected_album)].empty()) {
-                          id(current_cover_url) = id(filtered_album_images)[id(selected_album)];
-                        }
-                      } else if (screen == 2) {
-                        id(gesture_type) = 5;  // VOLUME_CHANGE
-                        id(current_volume) = std::min(id(current_volume) + 5, 100);
-                      }
-                    } else {
-                      // SWIPE LEFT = previous
-                      ESP_LOGI("touch", "SWIPE LEFT");
-                      id(gesture_type) = 3;  // PREV
-                      if (screen == 0 && id(artist_count) > 0) {
-                        id(selected_artist) = (id(selected_artist) + id(artist_count) - 1) % id(artist_count);
-                        if (id(selected_artist) < id(artist_images).size() && !id(artist_images)[id(selected_artist)].empty()) {
-                          id(current_cover_url) = id(artist_images)[id(selected_artist)];
-                        }
-                      } else if (screen == 1 && id(album_count) > 0) {
-                        id(selected_album) = (id(selected_album) + id(album_count) - 1) % id(album_count);
-                        if (id(selected_album) < id(filtered_album_images).size() && !id(filtered_album_images)[id(selected_album)].empty()) {
-                          id(current_cover_url) = id(filtered_album_images)[id(selected_album)];
-                        }
-                      } else if (screen == 2) {
-                        id(gesture_type) = 5;  // VOLUME_CHANGE
-                        id(current_volume) = std::max(id(current_volume) - 5, 0);
-                      }
-                    }
-                  } else {
-                    // Vertical swipe
-                    if (dy < 0) {
-                      // SWIPE UP = back
-                      ESP_LOGI("touch", "SWIPE UP (back)");
-                      id(gesture_type) = 4;  // BACK
-                      if (screen == 1) {
-                        id(current_screen) = 0;
-                      } else if (screen == 2) {
-                        id(is_playing) = false;
-                        id(current_screen) = 1;
-                      }
-                    } else {
-                      // SWIPE DOWN = select (same as tap)
-                      ESP_LOGI("touch", "SWIPE DOWN (select)");
-                      // Debounce: ignore if navigated recently (prevents double-tap skipping screens)
-                      if (millis() - id(last_nav_ms) < 400) {
-                        ESP_LOGD("touch", "Ignoring swipe down - debounce");
-                      } else {
-                        id(gesture_type) = 1;  // SELECT
-                        if (screen == 0) {
-                          id(current_screen) = 1;
-                          id(selected_album) = 0;
-                          id(last_nav_ms) = millis();
-                        } else if (screen == 1) {
-                          id(current_screen) = 2;
-                          id(is_playing) = true;
-                          id(last_nav_ms) = millis();
-                        } else if (screen == 2) {
-                          id(is_playing) = !id(is_playing);
-                        }
-                      }
-                    }
-                  }
-                }
-            # Execute post-gesture actions
-            - script.execute: touch_post_action
-
-  # Execute actions after touch gesture
-  # gesture_type: 0=none, 1=select, 2=next, 3=prev, 4=back, 5=volume_change
-  - id: touch_post_action
-    then:
-      # Skip if no gesture detected
-      - if:
-          condition:
-            lambda: 'return id(gesture_type) == 0;'
-          then:
-            - logger.log: "No gesture detected, skipping"
-          else:
-            # Fetch albums only when entering screen 1 from screen 0
-            - if:
-                condition:
-                  lambda: 'return id(current_screen) == 1 && id(screen_before_gesture) == 0;'
-                then:
-                  - script.execute: fetch_albums
-            # Always update display
-            - script.execute: update_display
-            # Update cover art on HOME/ALBUMS screens
-            - if:
-                condition:
-                  lambda: 'return id(current_screen) == 0 || id(current_screen) == 1;'
-                then:
-                  - script.execute: update_cover_art
-                  - script.execute: led_show_position
-            # Handle PLAYER screen actions
-            - if:
-                condition:
-                  # Just entered PLAYING from ALBUMS (select gesture)
-                  lambda: 'return id(current_screen) == 2 && id(screen_before_gesture) == 1 && id(gesture_type) == 1;'
-                then:
-                  - script.execute: ma_play_album
-                  - script.execute: led_playing
-            - if:
-                condition:
-                  # Toggle play/pause on PLAYING screen
-                  lambda: 'return id(current_screen) == 2 && id(screen_before_gesture) == 2 && id(gesture_type) == 1;'
-                then:
-                  - if:
-                      condition:
-                        lambda: 'return id(is_playing);'
-                      then:
-                        - script.execute: ma_resume
-                        - script.execute: led_playing
-                      else:
-                        - script.execute: ma_pause
-                        - script.execute: led_paused
-            - if:
-                condition:
-                  # Volume change on PLAYING screen
-                  lambda: 'return id(gesture_type) == 5;'
-                then:
-                  - script.execute: ma_set_volume
-                  - script.execute: led_show_volume
-            - if:
-                condition:
-                  # Back from PLAYING (stop playback)
-                  lambda: 'return id(gesture_type) == 4 && id(screen_before_gesture) == 2;'
-                then:
-                  - script.execute: ma_stop
-                  - script.execute: led_idle
-
-  # Fetch first page of albums and extract artists (lazy loading initial page)
-  - id: fetch_artists
-    then:
-      - logger.log: "Starting fetch_artists (first page)..."
-      - lambda: |-
-          id(artist_names).clear();
-          id(artist_ids).clear();
-          id(album_names).clear();
-          id(album_ids).clear();
-          id(album_uris).clear();
-          id(album_artist_ids).clear();
-          id(album_images).clear();
-          id(artist_images).clear();
-          id(loaded_album_count) = 0;
-          id(total_album_count) = 0;
-          id(initial_load_complete) = false;
-          id(loading_in_progress) = true;
-          ESP_LOGI("ma", "Fetching first page of albums...");
-      - script.execute: led_loading
-      - http_request.post:
-          url: "http://${ma_host}:${ma_port}/api"
-          capture_response: true
-          max_response_buffer_size: 65536
-          request_headers:
-            Content-Type: "application/json"
-            Authorization: "Bearer ${ma_token}"
-          body: '{"command":"music/albums/library_items","args":{"limit":25,"offset":0}}'
-          on_response:
-            then:
-              - lambda: |-
-                  ESP_LOGI("ma", "Got albums response: status=%d, len=%d", response->status_code, body.length());
-                  if (response->status_code == 200 && body.length() > 2) {
-                    JsonDocument doc;
-                    DeserializationError error = deserializeJson(doc, body);
-
-                    if (error) {
-                      ESP_LOGW("ma", "Initial parse failed: %s, trying fix...", error.c_str());
-                      std::string json_str = body;
-                      size_t last_complete = json_str.rfind("},{");
-                      if (last_complete != std::string::npos) {
-                        json_str = json_str.substr(0, last_complete + 1) + "]";
-                        error = deserializeJson(doc, json_str);
-                      }
-                    }
-
-                    if (error) {
-                      ESP_LOGE("ma", "JSON parse error: %s", error.c_str());
-                      id(loading_in_progress) = false;
-                    } else if (doc.is<JsonArray>()) {
-                      JsonArray arr = doc.as<JsonArray>();
-                      int page_count = arr.size();
-                      ESP_LOGI("ma", "Parsed %d albums (first page)", page_count);
-
-                      // Store all albums with their artist IDs
-                      for (JsonObject album : arr) {
-                        const char* name = album["name"] | "Unknown";
-                        const char* item_id = album["item_id"] | "0";
-                        const char* uri = album["uri"] | "";
-
-                        // Extract first artist from each album
-                        JsonArray artists = album["artists"];
-                        std::string album_artist_id = "0";
-                        if (artists.size() > 0) {
-                          JsonObject artist = artists[0];
-                          const char* artist_name = artist["name"] | "Unknown";
-                          const char* artist_id = artist["item_id"] | "0";
-                          album_artist_id = std::string(artist_id);
-
-                          // Check if we already have this artist in our list
-                          bool found = false;
-                          for (const auto& existing_id : id(artist_ids)) {
-                            if (existing_id == album_artist_id) {
-                              found = true;
-                              break;
-                            }
-                          }
-                          if (!found && id(artist_names).size() < 100) {
-                            id(artist_names).push_back(std::string(artist_name));
-                            id(artist_ids).push_back(album_artist_id);
-                            id(artist_images).push_back("");  // Placeholder, will fill below
-                            ESP_LOGD("ma", "Found artist: %s (id=%s)", artist_name, artist_id);
-                          }
-                        }
-
-                        // Store album with its artist ID and image
-                        id(album_names).push_back(std::string(name));
-                        id(album_ids).push_back(std::string(item_id));
-                        id(album_uris).push_back(std::string(uri));
-                        id(album_artist_ids).push_back(album_artist_id);
-
-                        // Extract cover art URL
-                        std::string image_url = "";
-                        if (album.containsKey("image")) {
-                          JsonObject img = album["image"];
-                          const char* path = img["path"] | "";
-                          if (strlen(path) > 0) {
-                            image_url = std::string(path);
-                          }
-                        }
-                        if (image_url.empty() && album.containsKey("metadata")) {
-                          JsonObject meta = album["metadata"];
-                          if (meta.containsKey("images")) {
-                            JsonArray images = meta["images"];
-                            if (images.size() > 0) {
-                              JsonObject first_img = images[0];
-                              const char* path = first_img["path"] | "";
-                              image_url = std::string(path);
-                            }
-                          }
-                        }
-                        // Convert Spotify URLs to smaller thumbnails
-                        size_t pos = image_url.find("ab67616d0000b273");
-                        if (pos != std::string::npos) {
-                          image_url.replace(pos, 16, "ab67616d00004851");
-                        }
-                        id(album_images).push_back(image_url);
-                      }
-
-                      // Update artist images (first album cover for each)
-                      for (int a = 0; a < id(artist_ids).size(); a++) {
-                        if (id(artist_images)[a].empty()) {
-                          std::string aid = id(artist_ids)[a];
-                          for (int b = 0; b < id(album_artist_ids).size(); b++) {
-                            if (id(album_artist_ids)[b] == aid && !id(album_images)[b].empty()) {
-                              id(artist_images)[a] = id(album_images)[b];
-                              break;
-                            }
-                          }
-                        }
-                      }
-
-                      id(artist_count) = id(artist_names).size();
-                      id(album_count) = id(album_names).size();
-                      id(loaded_album_count) = page_count;
-
-                      // If we got a full page, there might be more albums
-                      if (page_count >= 25) {
-                        id(total_album_count) = page_count + 25;  // Estimate more, will adjust as we load
-                        ESP_LOGI("ma", "First page full, more albums expected");
-                      } else {
-                        id(total_album_count) = page_count;  // This is all we have
-                      }
-
-                      id(initial_load_complete) = true;
-                      id(loading_in_progress) = false;
-                      ESP_LOGI("ma", "Initial load: %d artists, %d/%d albums", id(artist_count), id(loaded_album_count), id(total_album_count));
-                    }
-                  } else {
-                    ESP_LOGE("ma", "HTTP error: %d", response->status_code);
-                    id(loading_in_progress) = false;
-                  }
-      - logger.log: "fetch_artists script complete"
-      # Set cover for first artist
-      - lambda: |-
-          if (!id(artist_images).empty() && !id(artist_images)[0].empty()) {
-            id(current_cover_url) = id(artist_images)[0];
-            ESP_LOGI("ma", "Initial cover: %s", id(current_cover_url).c_str());
-          }
-      - script.execute: update_cover_art
-      - script.execute: update_home_display
-      # Stop LED loading if no more pages needed
-      - if:
-          condition:
-            lambda: 'return id(loaded_album_count) >= id(total_album_count);'
-          then:
-            - script.stop: led_loading
-            - script.execute: led_idle
-
-  # Filter albums for current artist (from already-loaded data)
-  - id: fetch_albums
-    then:
-      - lambda: |-
-          // Clear filtered lists
-          id(filtered_album_names).clear();
-          id(filtered_album_ids).clear();
-          id(filtered_album_uris).clear();
-          id(filtered_album_images).clear();
-
-          // Get selected artist ID
-          std::string target_artist_id = "";
-          std::string target_artist_name = "";
-          if (id(selected_artist) < id(artist_ids).size()) {
-            target_artist_id = id(artist_ids)[id(selected_artist)];
-            target_artist_name = id(artist_names)[id(selected_artist)];
-          }
-          ESP_LOGI("ma", "Filtering albums for artist: %s (id=%s)", target_artist_name.c_str(), target_artist_id.c_str());
-
-          // Filter albums by artist ID
-          int count = 0;
-          for (size_t i = 0; i < id(album_names).size() && count < 20; i++) {
-            if (id(album_artist_ids)[i] == target_artist_id) {
-              id(filtered_album_names).push_back(id(album_names)[i]);
-              id(filtered_album_ids).push_back(id(album_ids)[i]);
-              id(filtered_album_uris).push_back(id(album_uris)[i]);
-              id(filtered_album_images).push_back(id(album_images)[i]);
-              count++;
-            }
-          }
-          id(album_count) = count;
-          ESP_LOGI("ma", "Filtered %d albums for %s", count, target_artist_name.c_str());
-
-          // Set cover URL to first album's image for this artist
-          if (count > 0 && !id(filtered_album_images)[0].empty()) {
-            id(current_cover_url) = id(filtered_album_images)[0];
-            ESP_LOGI("ma", "Cover URL: %s", id(current_cover_url).c_str());
-          }
-      - script.execute: update_album_display
-      - script.execute: update_cover_art
-
-  # Fetch next page of albums (background lazy loading)
-  - id: fetch_album_page
-    mode: single
+  # Route to correct screen and set brightness
+  - id: update_display
     then:
       - if:
           condition:
-            lambda: 'return id(loading_in_progress) || !id(initial_load_complete);'
+            lambda: 'return id(current_screen) == 0;'
           then:
-            - logger.log: "Skipping page load - already loading or not initialized"
-          else:
-            - lambda: |-
-                id(loading_in_progress) = true;
-                ESP_LOGI("ma", "Loading album page at offset %d...", id(loaded_album_count));
-            - script.execute: led_loading
-            - http_request.post:
-                url: "http://${ma_host}:${ma_port}/api"
-                capture_response: true
-                max_response_buffer_size: 65536
-                request_headers:
-                  Content-Type: "application/json"
-                  Authorization: "Bearer ${ma_token}"
-                body: !lambda |-
-                  return "{\"command\":\"music/albums/library_items\",\"args\":{\"limit\":25,\"offset\":" +
-                         std::to_string(id(loaded_album_count)) + "}}";
-                on_response:
-                  then:
-                    - lambda: |-
-                        ESP_LOGI("ma", "Page response: status=%d, len=%d", response->status_code, body.length());
-                        if (response->status_code == 200 && body.length() > 2) {
-                          JsonDocument doc;
-                          DeserializationError error = deserializeJson(doc, body);
+            - lvgl.page.show: page_clock
+            - light.turn_on:
+                id: backlight
+                brightness: 50%
+                transition_length: 1s
+            - script.execute: update_clock_display
+      - if:
+          condition:
+            lambda: 'return id(current_screen) == 1;'
+          then:
+            - lvgl.page.show: page_player
+            - light.turn_on:
+                id: backlight
+                brightness: 100%
+                transition_length: 500ms
+            - script.execute: update_player_display
 
-                          if (error) {
-                            std::string json_str = body;
-                            size_t last_complete = json_str.rfind("},{");
-                            if (last_complete != std::string::npos) {
-                              json_str = json_str.substr(0, last_complete + 1) + "]";
-                              error = deserializeJson(doc, json_str);
-                            }
-                          }
+  # Update clock labels with current time
+  - id: update_clock_display
+    then:
+      - lvgl.label.update:
+          id: clock_time
+          text: !lambda |-
+            auto t = id(ha_time).now();
+            if (!t.is_valid()) return std::string("--:--");
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%02d:%02d", t.hour, t.minute);
+            return std::string(buf);
+      - lvgl.label.update:
+          id: clock_date
+          text: !lambda |-
+            auto t = id(ha_time).now();
+            if (!t.is_valid()) return std::string("");
+            char buf[16];
+            // day_of_week: 1=Sun, 2=Mon, ..., 7=Sat
+            const char* days[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+            const char* months[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+            snprintf(buf, sizeof(buf), "%s %d %s", days[t.day_of_week - 1], t.day_of_month, months[t.month - 1]);
+            return std::string(buf);
 
-                          if (error) {
-                            ESP_LOGE("ma", "JSON parse error: %s", error.c_str());
-                          } else if (doc.is<JsonArray>()) {
-                            JsonArray arr = doc.as<JsonArray>();
-                            int page_count = arr.size();
-                            ESP_LOGI("ma", "Parsed %d albums (page)", page_count);
+  # Update now-playing labels
+  - id: update_player_display
+    then:
+      - lvgl.label.update:
+          id: track_title
+          text: !lambda |-
+            return id(media_title).empty() ? std::string("Unknown") : id(media_title);
+      - lvgl.label.update:
+          id: track_artist
+          text: !lambda |-
+            return id(media_artist);
+      - lvgl.label.update:
+          id: play_icon
+          text: !lambda |-
+            return std::string(id(is_playing) ? "| |" : ">");
+      - lvgl.bar.update:
+          id: volume_bar
+          value: !lambda 'return id(current_volume);'
 
-                            for (JsonObject album : arr) {
-                              const char* name = album["name"] | "Unknown";
-                              const char* item_id = album["item_id"] | "0";
-                              const char* uri = album["uri"] | "";
-
-                              JsonArray artists = album["artists"];
-                              std::string album_artist_id = "0";
-                              if (artists.size() > 0) {
-                                JsonObject artist = artists[0];
-                                const char* artist_name = artist["name"] | "Unknown";
-                                const char* artist_id = artist["item_id"] | "0";
-                                album_artist_id = std::string(artist_id);
-
-                                // Check for new artist
-                                bool found = false;
-                                for (const auto& existing_id : id(artist_ids)) {
-                                  if (existing_id == album_artist_id) {
-                                    found = true;
-                                    break;
-                                  }
-                                }
-                                if (!found && id(artist_names).size() < 100) {
-                                  id(artist_names).push_back(std::string(artist_name));
-                                  id(artist_ids).push_back(album_artist_id);
-                                  id(artist_images).push_back("");
-                                  ESP_LOGD("ma", "New artist: %s", artist_name);
-                                }
-                              }
-
-                              id(album_names).push_back(std::string(name));
-                              id(album_ids).push_back(std::string(item_id));
-                              id(album_uris).push_back(std::string(uri));
-                              id(album_artist_ids).push_back(album_artist_id);
-
-                              std::string image_url = "";
-                              if (album.containsKey("image")) {
-                                JsonObject img = album["image"];
-                                const char* path = img["path"] | "";
-                                if (strlen(path) > 0) image_url = std::string(path);
-                              }
-                              size_t pos = image_url.find("ab67616d0000b273");
-                              if (pos != std::string::npos) {
-                                image_url.replace(pos, 16, "ab67616d00004851");
-                              }
-                              id(album_images).push_back(image_url);
-                            }
-
-                            // Update artist images for any new artists
-                            for (int a = 0; a < id(artist_ids).size(); a++) {
-                              if (id(artist_images)[a].empty()) {
-                                std::string aid = id(artist_ids)[a];
-                                for (int b = 0; b < id(album_artist_ids).size(); b++) {
-                                  if (id(album_artist_ids)[b] == aid && !id(album_images)[b].empty()) {
-                                    id(artist_images)[a] = id(album_images)[b];
-                                    break;
-                                  }
-                                }
-                              }
-                            }
-
-                            id(artist_count) = id(artist_names).size();
-                            id(loaded_album_count) += page_count;
-
-                            // Update total estimate
-                            if (page_count >= 25) {
-                              id(total_album_count) = id(loaded_album_count) + 25;
-                            } else {
-                              id(total_album_count) = id(loaded_album_count);
-                              ESP_LOGI("ma", "All albums loaded!");
-                            }
-
-                            ESP_LOGI("ma", "Progress: %d artists, %d/%d albums",
-                                     id(artist_count), id(loaded_album_count), id(total_album_count));
-                          }
-                        }
-                        id(loading_in_progress) = false;
-            # Only update home display if on home screen
-            - if:
-                condition:
-                  lambda: 'return id(current_screen) == 0;'
-                then:
-                  - script.execute: update_home_display
-            # Stop LED if all loaded
-            - if:
-                condition:
-                  lambda: 'return id(loaded_album_count) >= id(total_album_count);'
-                then:
-                  - script.stop: led_loading
-                  - script.execute: led_idle
-
-  # Update cover art image
+  # Fetch and display cover art
   - id: update_cover_art
     then:
       - if:
@@ -1201,252 +468,130 @@ script:
                 url: !lambda 'return id(current_cover_url);'
             - component.update: cover_art
 
-  # Update display based on current screen
-  - id: update_display
+  # Handle touch gestures
+  - id: handle_touch_gesture
     then:
-      - if:
-          condition:
-            lambda: 'return id(current_screen) == 0;'
-          then:
-            - lvgl.page.show: page_home
-            - script.execute: update_home_display
-      - if:
-          condition:
-            lambda: 'return id(current_screen) == 1;'
-          then:
-            - lvgl.page.show: page_albums
-            - script.execute: update_album_display
-      - if:
-          condition:
-            lambda: 'return id(current_screen) == 2;'
-          then:
-            - lvgl.page.show: page_player
-            - lvgl.bar.update:
-                id: volume_bar
-                value: !lambda 'return id(current_volume);'
-            - script.execute: update_player_display
+      - lambda: |-
+          int dx = id(touch_end_x) - id(touch_start_x);
+          int dy = id(touch_end_y) - id(touch_start_y);
+          uint32_t duration = millis() - id(touch_start_ms);
 
-  # Update HOME screen with current artist
-  - id: update_home_display
-    then:
-      - if:
-          condition:
-            lambda: 'return id(artist_count) > 0;'
-          then:
-            # Hide spinner, show content
-            - lvgl.widget.hide: home_spinner
-            - lvgl.widget.show: home_cover
-            - lvgl.widget.show: artist_title
-            - lvgl.widget.show: artist_subtitle
-            - lvgl.label.update:
-                id: artist_title
-                text: !lambda 'return id(artist_names)[id(selected_artist)].c_str();'
-            - lvgl.label.update:
-                id: artist_subtitle
-                text: !lambda |-
-                  static char buf[32];
-                  snprintf(buf, sizeof(buf), "%d / %d", id(selected_artist) + 1, id(artist_count));
-                  return buf;
-            # Update arc to show position
-            - lvgl.arc.update:
-                id: home_arc
-                value: !lambda |-
-                  if (id(artist_count) <= 1) return 100;
-                  return ((id(selected_artist) + 1) * 100) / id(artist_count);
-          else:
-            # Show spinner while loading
-            - lvgl.widget.show: home_spinner
-            - lvgl.widget.hide: home_cover
-            - lvgl.widget.hide: artist_title
-            - lvgl.widget.hide: artist_subtitle
-            - lvgl.arc.update:
-                id: home_arc
-                value: 0
+          const int SWIPE_THRESHOLD = 30;
+          const int TAP_MAX_MOVE = 20;
+          const uint32_t TAP_MAX_TIME = 300;
 
-  # Update ALBUMS screen with current album
-  - id: update_album_display
-    then:
-      - lvgl.label.update:
-          id: album_title
-          text: !lambda |-
-            if (id(album_count) > 0 && id(selected_album) < id(filtered_album_names).size()) {
-              return id(filtered_album_names)[id(selected_album)].c_str();
-            }
-            return "No albums";
-      - lvgl.label.update:
-          id: album_subtitle
-          text: !lambda |-
-            static char buf[32];
-            snprintf(buf, sizeof(buf), "%d / %d", id(selected_album) + 1, id(album_count));
-            return buf;
-      - lvgl.image.update:
-          id: album_cover
-          src: cover_art
-      # Update arc to show position
-      - lvgl.arc.update:
-          id: album_arc
-          value: !lambda |-
-            if (id(album_count) <= 1) return 100;
-            return ((id(selected_album) + 1) * 100) / id(album_count);
+          bool is_tap = (abs(dx) < TAP_MAX_MOVE && abs(dy) < TAP_MAX_MOVE && duration < TAP_MAX_TIME);
+          bool is_horizontal = abs(dx) > abs(dy);
+          bool is_swipe = (is_horizontal ? abs(dx) : abs(dy)) > SWIPE_THRESHOLD;
 
-  # Update PLAYER screen with current track
-  - id: update_player_display
-    then:
-      - lvgl.label.update:
-          id: track_title
-          text: !lambda |-
-            if (id(album_count) > 0 && id(selected_album) < id(filtered_album_names).size()) {
-              return id(filtered_album_names)[id(selected_album)].c_str();
-            }
-            return "Unknown";
-      - lvgl.label.update:
-          id: play_icon
-          text: !lambda |-
+          ESP_LOGI("touch", "dx=%d dy=%d dur=%dms tap=%d swipe=%d", dx, dy, duration, is_tap, is_swipe);
+
+          if (millis() - id(last_nav_ms) < 400) {
+            ESP_LOGD("touch", "Ignoring - debounce");
+            return;
+          }
+
+          if (is_tap) {
             if (id(is_playing)) {
-              return "| |";  // Pause symbol
+              id(ma_pause).execute();
+              id(led_paused).execute();
+            } else {
+              id(ma_resume).execute();
+              id(led_playing).execute();
             }
-            return ">";  // Play symbol
+            id(last_nav_ms) = millis();
+          } else if (is_swipe && is_horizontal) {
+            if (dx < 0) {
+              id(ma_next).execute();
+            } else {
+              id(ma_previous).execute();
+            }
+            id(last_nav_ms) = millis();
+          }
 
-  # Music Assistant API: Play album
-  - id: ma_play_album
-    then:
-      - http_request.post:
-          url: "http://${ma_host}:${ma_port}/api"
-          request_headers:
-            Content-Type: "application/json"
-            Authorization: "Bearer ${ma_token}"
-          body: !lambda |-
-            std::string uri = "";
-            if (id(selected_album) < id(filtered_album_uris).size()) {
-              uri = id(filtered_album_uris)[id(selected_album)];
-            }
-            std::string player = id(ma_player_id).state;
-            if (player.empty() || player == "unknown" || player == "unavailable") {
-              player = "${ma_player}";
-            }
-            ESP_LOGI("ma", "Playing on player: %s", player.c_str());
-            return "{\"command\":\"player_queues/play_media\",\"args\":{\"queue_id\":\"" + player + "\",\"media\":\"" + uri + "\",\"option\":\"replace\"}}";
-          on_response:
-            then:
-              - lambda: |-
-                  ESP_LOGI("ma", "Play album response: %d", response->status_code);
-
-  # Music Assistant API: Pause
+  # HA service: Pause
   - id: ma_pause
     then:
       - http_request.post:
-          url: "http://${ma_host}:${ma_port}/api"
+          url: "${ha_url}/api/services/media_player/media_pause"
           request_headers:
             Content-Type: "application/json"
-            Authorization: "Bearer ${ma_token}"
-          body: !lambda |-
-            std::string player = id(ma_player_id).state;
-            if (player.empty() || player == "unknown" || player == "unavailable") {
-              player = "${ma_player}";
-            }
-            return "{\"command\":\"player_queues/pause\",\"args\":{\"queue_id\":\"" + player + "\"}}";
+            Authorization: "Bearer ${ha_token}"
+          body: '{"entity_id":"media_player.${ma_player}"}'
           on_response:
             then:
-              - lambda: |-
-                  ESP_LOGI("ma", "Pause response: %d", response->status_code);
+              - lambda: 'ESP_LOGI("ha", "Pause: %d", response->status_code);'
 
-  # Music Assistant API: Resume/Play
+  # HA service: Resume/Play
   - id: ma_resume
     then:
       - http_request.post:
-          url: "http://${ma_host}:${ma_port}/api"
+          url: "${ha_url}/api/services/media_player/media_play"
           request_headers:
             Content-Type: "application/json"
-            Authorization: "Bearer ${ma_token}"
-          body: !lambda |-
-            std::string player = id(ma_player_id).state;
-            if (player.empty()) player = "${ma_player}";
-            return "{\"command\":\"player_queues/play\",\"args\":{\"queue_id\":\"" + player + "\"}}";
+            Authorization: "Bearer ${ha_token}"
+          body: '{"entity_id":"media_player.${ma_player}"}'
           on_response:
             then:
-              - lambda: |-
-                  ESP_LOGI("ma", "Resume response: %d", response->status_code);
+              - lambda: 'ESP_LOGI("ha", "Resume: %d", response->status_code);'
 
-  # Music Assistant API: Stop
+  # HA service: Stop
   - id: ma_stop
     then:
       - http_request.post:
-          url: "http://${ma_host}:${ma_port}/api"
+          url: "${ha_url}/api/services/media_player/media_stop"
           request_headers:
             Content-Type: "application/json"
-            Authorization: "Bearer ${ma_token}"
-          body: !lambda |-
-            std::string player = id(ma_player_id).state;
-            if (player.empty()) player = "${ma_player}";
-            return "{\"command\":\"player_queues/stop\",\"args\":{\"queue_id\":\"" + player + "\"}}";
+            Authorization: "Bearer ${ha_token}"
+          body: '{"entity_id":"media_player.${ma_player}"}'
           on_response:
             then:
-              - lambda: |-
-                  ESP_LOGI("ma", "Stop response: %d", response->status_code);
+              - lambda: 'ESP_LOGI("ha", "Stop: %d", response->status_code);'
 
-  # Music Assistant API: Set Volume
+  # HA service: Next track
+  - id: ma_next
+    then:
+      - http_request.post:
+          url: "${ha_url}/api/services/media_player/media_next_track"
+          request_headers:
+            Content-Type: "application/json"
+            Authorization: "Bearer ${ha_token}"
+          body: '{"entity_id":"media_player.${ma_player}"}'
+          on_response:
+            then:
+              - lambda: 'ESP_LOGI("ha", "Next: %d", response->status_code);'
+
+  # HA service: Previous track
+  - id: ma_previous
+    then:
+      - http_request.post:
+          url: "${ha_url}/api/services/media_player/media_previous_track"
+          request_headers:
+            Content-Type: "application/json"
+            Authorization: "Bearer ${ha_token}"
+          body: '{"entity_id":"media_player.${ma_player}"}'
+          on_response:
+            then:
+              - lambda: 'ESP_LOGI("ha", "Previous: %d", response->status_code);'
+
+  # HA service: Set volume (HA expects 0.0–1.0)
   - id: ma_set_volume
     then:
       - http_request.post:
-          url: "http://${ma_host}:${ma_port}/api"
+          url: "${ha_url}/api/services/media_player/volume_set"
           request_headers:
             Content-Type: "application/json"
-            Authorization: "Bearer ${ma_token}"
+            Authorization: "Bearer ${ha_token}"
           body: !lambda |-
-            std::string player = id(ma_player_id).state;
-            if (player.empty()) player = "${ma_player}";
-            return "{\"command\":\"players/cmd/volume_set\",\"args\":{\"player_id\":\"" + player + "\",\"volume_level\":" + std::to_string(id(current_volume)) + "}}";
+            char buf[80];
+            snprintf(buf, sizeof(buf), "{\"entity_id\":\"media_player.${ma_player}\",\"volume_level\":%.2f}",
+                     id(current_volume) / 100.0f);
+            return std::string(buf);
           on_response:
             then:
-              - lambda: |-
-                  ESP_LOGI("ma", "Volume response: %d", response->status_code);
+              - lambda: 'ESP_LOGI("ha", "Volume %d%%: %d", id(current_volume), response->status_code);'
 
-  # LED Feedback: Show position (1-5 LEDs based on index)
-  - id: led_show_position
-    mode: restart
-    then:
-      - light.addressable_set:
-          id: rgb_leds
-          range_from: 0
-          range_to: 4
-          red: 0%
-          green: 0%
-          blue: 20%
-      - lambda: |-
-          int pos = 0;
-          int count = 1;
-          if (id(current_screen) == 0) {
-            pos = id(selected_artist);
-            count = id(artist_count);
-          } else if (id(current_screen) == 1) {
-            pos = id(selected_album);
-            count = id(album_count);
-          }
-          // Map position to LED (0-4)
-          int led = (count > 0) ? (pos * 5 / count) : 0;
-          led = std::min(led, 4);
-          auto call = id(rgb_leds).make_call();
-          call.set_state(true);
-          call.perform();
-      - light.addressable_set:
-          id: rgb_leds
-          range_from: !lambda |-
-            int pos = (id(current_screen) == 0) ? id(selected_artist) : id(selected_album);
-            int count = (id(current_screen) == 0) ? id(artist_count) : id(album_count);
-            return (count > 0) ? std::min(pos * 5 / count, 4) : 0;
-          range_to: !lambda |-
-            int pos = (id(current_screen) == 0) ? id(selected_artist) : id(selected_album);
-            int count = (id(current_screen) == 0) ? id(artist_count) : id(album_count);
-            return (count > 0) ? std::min(pos * 5 / count, 4) : 0;
-          red: 0%
-          green: 100%
-          blue: 0%
-      - delay: 1s
-      - light.turn_off:
-          id: rgb_leds
-          transition_length: 500ms
-
-  # LED Feedback: Playing state - brief green flash
+  # LED: Playing - brief green flash
   - id: led_playing
     mode: restart
     then:
@@ -1462,7 +607,7 @@ script:
           id: rgb_leds
           transition_length: 500ms
 
-  # LED Feedback: Paused state - brief yellow flash
+  # LED: Paused - brief amber flash
   - id: led_paused
     mode: restart
     then:
@@ -1478,66 +623,7 @@ script:
           id: rgb_leds
           transition_length: 500ms
 
-  # LED Feedback: Volume indicator (fill LEDs based on volume)
-  - id: led_show_volume
-    mode: restart
-    then:
-      # Update volume bar on screen and show
-      - lvgl.bar.update:
-          id: volume_bar
-          value: !lambda 'return id(current_volume);'
-      - lvgl.widget.show: volume_container
-      # LED feedback
-      - light.addressable_set:
-          id: rgb_leds
-          range_from: 0
-          range_to: 4
-          red: 0%
-          green: 0%
-          blue: 0%
-      - light.addressable_set:
-          id: rgb_leds
-          range_from: 0
-          range_to: !lambda 'return (id(current_volume) / 20);'
-          red: 0%
-          green: 100%
-          blue: 0%
-      - delay: 2s
-      # Hide volume indicator
-      - lvgl.widget.hide: volume_container
-      - light.turn_off:
-          id: rgb_leds
-          transition_length: 500ms
-
-  # LED Feedback: Loading - slow blue pulse while background loading
-  - id: led_loading
-    mode: restart
-    then:
-      - while:
-          condition:
-            lambda: 'return id(loading_in_progress) || (id(loaded_album_count) < id(total_album_count));'
-          then:
-            - light.turn_on:
-                id: rgb_leds
-                brightness: 20%
-                red: 10%
-                green: 30%
-                blue: 100%
-                transition_length: 800ms
-            - delay: 1s
-            - light.turn_on:
-                id: rgb_leds
-                brightness: 5%
-                red: 0%
-                green: 10%
-                blue: 40%
-                transition_length: 800ms
-            - delay: 1s
-      - light.turn_off:
-          id: rgb_leds
-          transition_length: 500ms
-
-  # LED Feedback: Idle/boot - brief blue flash then off
+  # LED: Idle/boot - brief blue flash
   - id: led_idle
     mode: restart
     then:
@@ -1553,10 +639,45 @@ script:
           id: rgb_leds
           transition_length: 500ms
 
-# ============================================
-# Display with LVGL
-# ============================================
+  # LED + on-screen: Volume change indicator
+  - id: led_show_volume
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return id(current_screen) == 1;'
+          then:
+            - lvgl.bar.update:
+                id: volume_bar
+                value: !lambda 'return id(current_volume);'
+            - lvgl.widget.show: volume_container
+      - light.addressable_set:
+          id: rgb_leds
+          range_from: 0
+          range_to: 4
+          red: 0%
+          green: 0%
+          blue: 0%
+      - light.addressable_set:
+          id: rgb_leds
+          range_from: 0
+          range_to: !lambda 'return std::min(id(current_volume) / 20, 4);'
+          red: 0%
+          green: 100%
+          blue: 0%
+      - delay: 2s
+      - if:
+          condition:
+            lambda: 'return id(current_screen) == 1;'
+          then:
+            - lvgl.widget.hide: volume_container
+      - light.turn_off:
+          id: rgb_leds
+          transition_length: 500ms
 
+# ============================================
+# Display
+# ============================================
 display:
   - platform: ili9xxx
     model: GC9A01A
@@ -1572,198 +693,59 @@ display:
     data_rate: 40MHz
     auto_clear_enabled: false
 
-# LVGL Configuration
+# ============================================
+# LVGL UI
+# ============================================
 lvgl:
   displays:
     - main_display
   color_depth: 16
   buffer_size: 25%
   log_level: WARN
-  page_wrap: true
+  page_wrap: false
   pages:
     # ================================================
-    # Home Screen - Artist Selection (SquareLine style)
-    # ================================================
-    - id: page_home
-      bg_color: 0x464B55
+    # Clock Screen - shown when idle
+    # ################################################
+    - id: page_clock
+      bg_color: 0x0C191E
       widgets:
-        # Outer arc ring (navigation indicator)
-        - arc:
-            id: home_arc
-            align: CENTER
-            width: 240
-            height: 240
-            arc_width: 12
-            start_angle: 0
-            end_angle: 360
-            mode: NORMAL
-            value: 0
-            min_value: 0
-            max_value: 100
-            adjustable: false
-            arc_color: 0x0F1215
-            indicator:
-              arc_color: 0x36B9F6
-              arc_width: 12
-            knob:
-              bg_opa: 0%
-        # Outer decorative ring
+        # Subtle outer ring
         - obj:
             align: CENTER
-            width: 200
-            height: 200
-            radius: 100
-            bg_color: 0x646464
-            border_color: 0x2D323C
+            width: 220
+            height: 220
+            radius: 110
+            bg_opa: 0%
+            border_color: 0x1E3040
             border_width: 2
-            shadow_color: 0x050A0F
-            shadow_width: 40
-            shadow_ofs_y: 15
             scrollbar_mode: "OFF"
-            widgets:
-              # Inner content circle
-              - obj:
-                  align: CENTER
-                  width: 180
-                  height: 180
-                  radius: 90
-                  bg_color: 0x0C191E
-                  border_color: 0x5A646E
-                  border_width: 1
-                  scrollbar_mode: "OFF"
-                  widgets:
-                    # Loading spinner
-                    - spinner:
-                        id: home_spinner
-                        align: CENTER
-                        width: 80
-                        height: 80
-                        arc_length: 60
-                        spin_time: 1s
-                        arc_color: 0x333333
-                        indicator:
-                          arc_color: 0x36B9F6
-                    # Cover art
-                    - image:
-                        id: home_cover
-                        align: TOP_MID
-                        y: 12
-                        width: 70
-                        height: 70
-                        src: cover_art
-                        bg_color: 0x0C191E
-                        hidden: true
-                    # Artist name
-                    - label:
-                        id: artist_title
-                        align: CENTER
-                        y: 30
-                        width: 160
-                        height: 40
-                        text: ""
-                        text_font: nanopod_font_18
-                        text_color: 0xFFFFFF
-                        long_mode: WRAP
-                        text_align: CENTER
-                        hidden: true
-                    # Position indicator (e.g., "2 / 5")
-                    - label:
-                        id: artist_subtitle
-                        align: BOTTOM_MID
-                        y: -5
-                        text: ""
-                        text_font: nanopod_font_14
-                        text_color: 0x808080
-                        hidden: true
-
-    # ================================================
-    # Albums Screen (SquareLine style)
-    # ================================================
-    - id: page_albums
-      bg_color: 0x464B55
-      widgets:
-        # Outer arc ring
-        - arc:
-            id: album_arc
+        # Time (large, centered)
+        - label:
+            id: clock_time
             align: CENTER
-            width: 240
-            height: 240
-            arc_width: 12
-            start_angle: 0
-            end_angle: 360
-            mode: NORMAL
-            value: 0
-            min_value: 0
-            max_value: 100
-            adjustable: false
-            arc_color: 0x0F1215
-            indicator:
-              arc_color: 0x1DB954
-              arc_width: 12
-            knob:
-              bg_opa: 0%
-        # Outer decorative ring
-        - obj:
+            y: -15
+            text: "--:--"
+            text_font: nanopod_font_32
+            text_color: 0xEEEEEE
+            text_align: CENTER
+        # Date (smaller, below time)
+        - label:
+            id: clock_date
             align: CENTER
-            width: 200
-            height: 200
-            radius: 100
-            bg_color: 0x646464
-            border_color: 0x2D323C
-            border_width: 2
-            shadow_color: 0x050A0F
-            shadow_width: 40
-            shadow_ofs_y: 15
-            scrollbar_mode: "OFF"
-            widgets:
-              # Inner content circle
-              - obj:
-                  align: CENTER
-                  width: 180
-                  height: 180
-                  radius: 90
-                  bg_color: 0x0C191E
-                  border_color: 0x5A646E
-                  border_width: 1
-                  scrollbar_mode: "OFF"
-                  widgets:
-                    # Cover art
-                    - image:
-                        id: album_cover
-                        align: TOP_MID
-                        y: 12
-                        width: 70
-                        height: 70
-                        src: cover_art
-                        bg_color: 0x0C191E
-                    # Album name
-                    - label:
-                        id: album_title
-                        align: CENTER
-                        y: 30
-                        width: 160
-                        height: 40
-                        text: ""
-                        text_font: nanopod_font_16
-                        text_color: 0xFFFFFF
-                        long_mode: WRAP
-                        text_align: CENTER
-                    # Position indicator
-                    - label:
-                        id: album_subtitle
-                        align: BOTTOM_MID
-                        y: -5
-                        text: ""
-                        text_font: nanopod_font_14
-                        text_color: 0x808080
+            y: 28
+            text: ""
+            text_font: nanopod_font_16
+            text_color: 0x4A7A9B
+            text_align: CENTER
 
-    # ================================================
-    # Now Playing Screen (SquareLine style)
-    # ================================================
+    # ################################################
+    # Now Playing Screen
+    # ################################################
     - id: page_player
       bg_color: 0x464B55
       widgets:
-        # Progress arc (outer ring) - transparent main arc
+        # Outer progress arc (plays from 135° to 45°)
         - arc:
             id: progress_arc
             align: CENTER
@@ -1779,7 +761,7 @@ lvgl:
             bg_opa: 0%
             arc_opa: 0%
             indicator:
-              arc_color: 0x1DB954
+              arc_color: 0x36B9F6
               arc_width: 15
               arc_opa: 100%
             knob:
@@ -1818,7 +800,7 @@ lvgl:
                         height: 70
                         src: cover_art
                         bg_color: 0x0C191E
-                    # Play/pause overlay on cover
+                    # Play/pause icon over cover
                     - obj:
                         align: TOP_MID
                         y: 25
@@ -1836,23 +818,35 @@ lvgl:
                               text: ">"
                               text_font: nanopod_font_24
                               text_color: 0xFFFFFF
-                    # Track/Album title
+                    # Track title (scrolls if long)
                     - label:
                         id: track_title
                         align: CENTER
-                        y: 35
+                        y: 28
                         width: 160
-                        height: 40
+                        height: 30
                         text: ""
                         text_font: nanopod_font_16
                         text_color: 0xFFFFFF
-                        long_mode: WRAP
+                        long_mode: DOT
                         text_align: CENTER
-                    # Volume indicator container (hidden by default, shown on volume change)
+                    # Artist name
+                    - label:
+                        id: track_artist
+                        align: CENTER
+                        y: 60
+                        width: 160
+                        height: 24
+                        text: ""
+                        text_font: nanopod_font_14
+                        text_color: 0x808080
+                        long_mode: DOT
+                        text_align: CENTER
+                    # Volume overlay (hidden, shown briefly on volume change)
                     - obj:
                         id: volume_container
                         align: CENTER
-                        y: 75
+                        y: 80
                         width: 130
                         height: 24
                         bg_color: 0x0C191E
@@ -1862,15 +856,12 @@ lvgl:
                         scrollbar_mode: "OFF"
                         hidden: true
                         widgets:
-                          # Speaker icon
                           - label:
-                              id: volume_icon
                               align: LEFT_MID
                               x: 8
                               text: "Vol"
                               text_font: nanopod_font_14
                               text_color: 0x808080
-                          # Volume bar
                           - bar:
                               id: volume_bar
                               align: RIGHT_MID
@@ -1897,13 +888,6 @@ font:
   - file: "gfonts://Montserrat"
     id: nanopod_font_16
     size: 16
-    bpp: 4
-    glyphsets:
-      - GF_Latin_Kernel
-      - GF_Latin_Core
-  - file: "gfonts://Montserrat"
-    id: nanopod_font_18
-    size: 18
     bpp: 4
     glyphsets:
       - GF_Latin_Kernel
