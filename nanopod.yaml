@@ -35,7 +35,6 @@ esp32:
     type: esp-idf
     version: recommended
     sdkconfig_options:
-      CONFIG_HTTPD_MAX_REQ_HDR_LEN: "1024"
       CONFIG_ESP_HTTP_CLIENT_BUF_SIZE: "1024"
   flash_size: 16MB
 
@@ -63,7 +62,7 @@ ota:
     password: !secret ota_password
 
 logger:
-  level: DEBUG
+  level: INFO
 
 # ============================================
 # Time (from Home Assistant)
@@ -171,9 +170,6 @@ sensor:
       - script.execute: ma_set_volume
       - script.execute: led_show_volume
 
-# ============================================
-# HTTP for Music Assistant API
-# ============================================
 http_request:
   useragent: esphome/nanopod
   timeout: 10s
@@ -284,13 +280,6 @@ light:
     pin: GPIO48
     num_leds: 5
     name: "Status LEDs"
-    effects:
-      - pulse:
-          name: "Playing Pulse"
-          transition_length: 1s
-          update_interval: 1s
-          min_brightness: 30%
-          max_brightness: 100%
 
 # ============================================
 # Global State
@@ -745,27 +734,6 @@ lvgl:
     - id: page_player
       bg_color: 0x464B55
       widgets:
-        # Outer progress arc (plays from 135° to 45°)
-        - arc:
-            id: progress_arc
-            align: CENTER
-            width: 240
-            height: 240
-            arc_width: 15
-            start_angle: 135
-            end_angle: 45
-            value: 0
-            min_value: 0
-            max_value: 100
-            adjustable: false
-            bg_opa: 0%
-            arc_opa: 0%
-            indicator:
-              arc_color: 0x36B9F6
-              arc_width: 15
-              arc_opa: 100%
-            knob:
-              bg_opa: 0%
         # Outer decorative ring
         - obj:
             align: CENTER
